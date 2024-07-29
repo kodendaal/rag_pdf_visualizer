@@ -2,10 +2,15 @@ torch
 transformers
 sentence-transformers
 langchain
+langchain-core
 langchain-community
+langchain-huggingface
+huggingface_hub
 tqdm
 accelerate
 pypdf
+pymupdf
 chromadb
 unidecode
-huggingface_hub
+
+
