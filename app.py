@@ -1,64 +1,87 @@
 import gradio as gr
 import os
 
-from langchain_community.document_loaders.pdf import PyPDFLoader
+from langchain_community.document_loaders import PyPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import Chroma
-from langchain.chains import ConversationalRetrievalChain
 from langchain_community.embeddings import HuggingFaceEmbeddings 
-from langchain_community.llms import HuggingFacePipeline
-from langchain.chains import ConversationChain
+from langchain_huggingface import HuggingFacePipeline
+from langchain.chains.conversational_retrieval.base import ConversationalRetrievalChain
+from langchain.chains.retrieval_qa.base import RetrievalQA
 from langchain.memory import ConversationBufferMemory
-from langchain_community.llms import HuggingFaceEndpoint
+from langchain_community.llms.huggingface_endpoint import HuggingFaceEndpoint
+from langchain_core.prompts.prompt import PromptTemplate
+
 
 from pathlib import Path
 import chromadb
 from unidecode import unidecode
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
+
 import transformers
 import torch
 import tqdm 
 import accelerate
 import re
-# import fitz
-# from PIL import Image
 
+import fitz
+from PIL import Image
+
+# extract secret HF token
 token = os.environ["HF_TOKEN"]
 
-
-# default_persist_directory = './chroma_HF/'
+# create list of LLM model paths
 list_llm = [
-    "mistralai/Mistral-7B-Instruct-v0.2"
+    "mistralai/Mistral-7B-Instruct-v0.2",
+    "distilgpt2",
+    "HuggingFaceTB/SmolLM-1.7B-Instruct"
 ]
-
-# list_llm = ["mistralai/Mistral-7B-Instruct-v0.2", "mistralai/Mixtral-8x7B-Instruct-v0.1", "mistralai/Mistral-7B-Instruct-v0.1", \
-#     "google/gemma-7b-it","google/gemma-2b-it", \
-#     "HuggingFaceH4/zephyr-7b-beta", "HuggingFaceH4/zephyr-7b-gemma-v0.1", \
-#     "meta-llama/Llama-2-7b-chat-hf", "microsoft/phi-2", \
-#     "TinyLlama/TinyLlama-1.1B-Chat-v1.0", "mosaicml/mpt-7b-instruct", "tiiuae/falcon-7b-instruct", \
-#     "google/flan-t5-xxl"
-# ]
 
 list_llm_simple = [os.path.basename(llm) for llm in list_llm]
 
+# alternative models (hugging face inference points)
+# list_llm = [
+#     "mistralai/Mistral-7B-Instruct-v0.2", 
+#     "mistralai/Mixtral-8x7B-Instruct-v0.1", \
+#     "mistralai/Mistral-7B-Instruct-v0.1", \
+#     "google/gemma-7b-it",
+#     "google/gemma-2b-it", \
+#     "HuggingFaceH4/zephyr-7b-beta", \
+#     "HuggingFaceH4/zephyr-7b-gemma-v0.1", \
+#     "meta-llama/Llama-2-7b-chat-hf", \
+#     "microsoft/phi-2", \
+#     "TinyLlama/TinyLlama-1.1B-Chat-v1.0", \
+#     "mosaicml/mpt-7b-instruct", \
+#     "tiiuae/falcon-7b-instruct", \
+#     "google/flan-t5-xxl"
+# ]
+
 # Load PDF document and create doc splits
 def load_doc(list_file_path, chunk_size, chunk_overlap):
-    # Processing for one document only
-    # loader = PyPDFLoader(file_path)
-    # pages = loader.load()
     loaders = [PyPDFLoader(x) for x in list_file_path]
     pages = []
+    
     for loader in loaders:
         pages.extend(loader.load())
+        
     text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size = chunk_size, 
-        chunk_overlap = chunk_overlap)
+       chunk_size = chunk_size, 
+       chunk_overlap = chunk_overlap
+    )
     doc_splits = text_splitter.split_documents(pages)
+    
+    # Clean up unnecessary spaces in each document split
+    for i, doc in enumerate(doc_splits):
+        cleaned_content = ' '.join(doc.page_content.split())
+        doc_splits[i].page_content = cleaned_content
+        print(f"Chunk {i+1}: {len(cleaned_content)} characters")
+        print(doc.page_content)
+    
     return doc_splits
 
 
-# Create vector database
+# Create vector database using Chroma
 def create_db(splits, collection_name):
     embedding = HuggingFaceEmbeddings()
     new_client = chromadb.EphemeralClient()
@@ -67,45 +90,58 @@ def create_db(splits, collection_name):
         embedding=embedding,
         client=new_client,
         collection_name=collection_name,
+        collection_metadata={"hnsw:space": "cosine"}
         # persist_directory=default_persist_directory
     )
+    
     return vectordb
 
+def load_tokenizer(llm_model):
+    tokenizer = AutoTokenizer.from_pretrained(llm_model)
+    
+    return tokenizer 
 
-# Load vector database
-def load_db():
-    embedding = HuggingFaceEmbeddings()
-    vectordb = Chroma(
-        # persist_directory=default_persist_directory, 
-        embedding_function=embedding)
-    return vectordb
+def load_model(llm_model):
+    model = AutoModelForCausalLM.from_pretrained(
+        llm_model,
+        device_map='auto',
+        torch_dtype=torch.float32,
+        token=True,
+        load_in_8bit=False,
+    )
+    
+    return model
 
+def create_pipeline(llm_model, max_tokens, top_k, temperature):
+    tok = load_tokenizer(llm_model)
+    mod = load_model(llm_model)
+    pipe = pipeline(
+        task='text-generation',
+        model=mod,
+        tokenizer=tok,
+        max_new_tokens=max_tokens, 
+        do_sample=True,
+        top_k=top_k,
+        trust_remote_code=True,
+        num_return_sequences=1, 
+        eos_token_id=tok.eos_token_id
+    )
+    
+    pipeline_llm = HuggingFacePipeline(pipeline=pipe, model_kwargs={'temperature': temperature})
+    
+    return pipeline_llm
 
 # Initialize langchain LLM chain
-def initialize_llmchain(llm_model, temperature, max_tokens, top_k, vector_db, progress=gr.Progress()):
+def initialize_llmchain(llm_model, temperature, max_tokens, top_k, vector_db, system_prompt, progress=gr.Progress()):
     progress(0.1, desc="Initializing HF tokenizer...")
+
+    
+    progress(0.5, desc="Initializing HF Hub...")
     # HuggingFacePipeline uses local model
     # Note: it will download model locally...
-    # tokenizer=AutoTokenizer.from_pretrained(llm_model)
-    # progress(0.5, desc="Initializing HF pipeline...")
-    # pipeline=transformers.pipeline(
-    #     "text-generation",
-    #     model=llm_model,
-    #     tokenizer=tokenizer,
-    #     torch_dtype=torch.bfloat16,
-    #     trust_remote_code=True,
-    #     device_map="auto",
-    #     # max_length=1024,
-    #     max_new_tokens=max_tokens,
-    #     do_sample=True,
-    #     top_k=top_k,
-    #     num_return_sequences=1,
-    #     eos_token_id=tokenizer.eos_token_id
-    #     )
-    # llm = HuggingFacePipeline(pipeline=pipeline, model_kwargs={'temperature': temperature})
-    
+    # llm = create_pipeline(llm_model, max_tokens, top_k, temperature)
+
     # HuggingFaceHub uses HF inference endpoints
-    progress(0.5, desc="Initializing HF Hub...")
     # Use of trust_remote_code as model_kwargs
     # Warning: langchain issue
     # URL: https://github.com/langchain-ai/langchain/issues/6080
@@ -116,6 +152,8 @@ def initialize_llmchain(llm_model, temperature, max_tokens, top_k, vector_db, pr
         top_k = top_k,
         huggingfacehub_api_token=token
     )
+    
+    # additional possible models to use:
     # if llm_model == "mistralai/Mixtral-8x7B-Instruct-v0.1":
     #     llm = HuggingFaceEndpoint(
     #         repo_id=llm_model, 
@@ -173,55 +211,91 @@ def initialize_llmchain(llm_model, temperature, max_tokens, top_k, vector_db, pr
     #         huggingfacehub_api_token=token
     #     )
         
-    
     progress(0.75, desc="Defining buffer memory...")
+    
+    # general_system_template = r""" 
+    # Given a specific context, please give a short answer to the question, covering the required advices in general and then provide the names all of relevant(even if it relates a bit) products. 
+    # ----
+    # {context}
+    # ----
+    # """
+    # general_user_template = "Question:```{question}```"
+    # messages = [
+    #             SystemMessagePromptTemplate.from_template(general_system_template),
+    #             HumanMessagePromptTemplate.from_template(general_user_template)
+    # ]
+    # qa_prompt = ChatPromptTemplate.from_messages( messages )
+        
+    
+    # template = """You are named MARLIN a smart agent who offers knowledge about MARIN (Maritime Research Institute Netherlands). 
+    # Given a specific context, please give a short and accurate answer to the question. Always finish your answer with a sign-off: MARLIN. 
+    # Chat History: {chat_history}
+    # Context: {context}
+    # Follow Up Input: {question}
+    # Helpful Answer: """
+
+    # PROMPT = PromptTemplate(
+    #     input_variables=["chat_history", "context", "question"], 
+    #     template =template
+    # )
+    
     memory = ConversationBufferMemory(
         memory_key="chat_history",
         output_key='answer',
         return_messages=True
     )
-    # retriever=vector_db.as_retriever(search_type="similarity", search_kwargs={'k': 3})
-    retriever=vector_db.as_retriever()
+    
     progress(0.8, desc="Defining retrieval chain...")
+    retriever_db = vector_db.as_retriever(search_type="similarity", search_kwargs={'k': top_k})
+    
     qa_chain = ConversationalRetrievalChain.from_llm(
-        llm,
-        retriever=retriever,
-        chain_type="stuff", 
-        memory=memory,
-        # combine_docs_chain_kwargs={"prompt": your_prompt})
-        return_source_documents=True,
-        #return_generated_question=False,
-        verbose=False,
+    # qa_chain = RetrievalQA.from_chain_type(
+        llm=llm,
+        retriever = retriever_db,
+        chain_type = "stuff", 
+        return_source_documents = True,
+        verbose = False,
+        memory = memory,
+        # chain_type_kwargs={"prompt":PROMPT}
+        # combine_docs_chain_kwargs={"prompt": PROMPT}
+        # return_generated_question=False,
     )
     progress(0.9, desc="Done!")
+    
     return qa_chain
 
 
 # Generate collection name for vector database
-#  - Use filepath as input, ensuring unicode text
+#  - Use filepath as input, ensuring unicode text   
 def create_collection_name(filepath):
     # Extract filename without extension
     collection_name = Path(filepath).stem
-    # Fix potential issues from naming convention
+    
     ## Remove space
     collection_name = collection_name.replace(" ","-") 
+    
     ## ASCII transliterations of Unicode text
     collection_name = unidecode(collection_name)
+    
     ## Remove special characters
-    #collection_name = re.findall("[\dA-Za-z]*", collection_name)[0]
     collection_name = re.sub('[^A-Za-z0-9]+', '-', collection_name)
+    
     ## Limit length to 50 characters
     collection_name = collection_name[:50]
+    
     ## Minimum length of 3 characters
     if len(collection_name) < 3:
         collection_name = collection_name + 'xyz'
+        
     ## Enforce start and end as alphanumeric character
     if not collection_name[0].isalnum():
         collection_name = 'A' + collection_name[1:]
     if not collection_name[-1].isalnum():
         collection_name = collection_name[:-1] + 'Z'
+        
     print('Filepath: ', filepath)
     print('Collection name: ', collection_name)
+    
     return collection_name
 
 
@@ -229,93 +303,169 @@ def create_collection_name(filepath):
 def initialize_database(list_file_obj, chunk_size, chunk_overlap, progress=gr.Progress()):
     # Create list of documents (when valid)
     list_file_path = [x.name for x in list_file_obj if x is not None]
+    
     # Create collection_name for vector database
     progress(0.1, desc="Creating collection name...")
     collection_name = create_collection_name(list_file_path[0])
-    progress(0.25, desc="Loading document...")
+
     # Load document and create splits
+    progress(0.25, desc="Loading document...")
     doc_splits = load_doc(list_file_path, chunk_size, chunk_overlap)
-    # Create or load vector database
+    
+    # Create or load vector database (global vector_db)
     progress(0.5, desc="Generating vector database...")
-    # global vector_db
     vector_db = create_db(doc_splits, collection_name)
+    
     progress(0.9, desc="Done!")
+    
     return vector_db, collection_name, "Complete!"
 
 
-def initialize_LLM(llm_option, llm_temperature, max_tokens, top_k, vector_db, progress=gr.Progress()):
-    # print("llm_option",llm_option)
-    llm_name = list_llm[llm_option]
-    print("llm_name: ",llm_name)
-    qa_chain = initialize_llmchain(llm_name, llm_temperature, max_tokens, top_k, vector_db, progress)
+# Initialize LLM
+def initialize_LLM(llm_option, llm_temperature, max_tokens, top_k, vector_db, system_prompt, progress=gr.Progress()):
+
+    llm_name = list_llm[llm_option]    
+    qa_chain = initialize_llmchain(llm_name, llm_temperature, max_tokens, top_k, vector_db, system_prompt, progress)
+    
     return qa_chain, "Complete!"
 
 
+# Format chat history into user and bot messages
 def format_chat_history(message, chat_history):
     formatted_chat_history = []
+    
     for user_message, bot_message in chat_history:
         formatted_chat_history.append(f"User: {user_message}")
         formatted_chat_history.append(f"Assistant: {bot_message}")
+        
     return formatted_chat_history
     
 
 def conversation(qa_chain, message, history):
-    formatted_chat_history = format_chat_history(message, history)
-    #print("formatted_chat_history",formatted_chat_history)
-   
+    
     # Generate response using QA chain
+    formatted_chat_history = format_chat_history(message, history)
     response = qa_chain({"question": message, "chat_history": formatted_chat_history})
-    response_answer = response["answer"]
-    if response_answer.find("Helpful Answer:") != -1:
+    
+    # Extract retriever from the chain
+    retriever = qa_chain.retriever
+    print(retriever)
+    results = retriever.get_relevant_documents(message)
+
+    # Access the documents and similarity scores
+    for result in results:
+        print('RAG inspect:', result)
+        print("Document:", result.page_content)  # Adjust based on your result format
+        print("Metadata:", result.metadata)
+        # print("Similarity Score:", result.score)  # Adjust based on your result format
+        
+    # Print response to understand its structure
+    print("QA Chain Response:", response)
+    
+    # Handling response structure
+    if "result" in response:
+        response_answer = response["result"]
+    elif "answer" in response:
+        response_answer = response["answer"]
+    else:
+        raise KeyError("Response does not contain 'result' or 'answer' key")
+    
+    # Extract helpful answer if necessary
+    if "Helpful Answer:" in response_answer:
         response_answer = response_answer.split("Helpful Answer:")[-1]
+        
     response_sources = response["source_documents"]
-    response_source1 = response_sources[0].page_content.strip()
-    response_source2 = response_sources[1].page_content.strip()
-    response_source3 = response_sources[2].page_content.strip()
-    # Langchain sources are zero-based
-    response_source1_page = response_sources[0].metadata["page"] + 1
-    response_source2_page = response_sources[1].metadata["page"] + 1
-    response_source3_page = response_sources[2].metadata["page"] + 1
-    # print ('chat response: ', response_answer)
-    # print('DB source', response_sources)
+    
+    # Handle possible fewer sources
+    response_source1 = response_sources[0].page_content.strip() if len(response_sources) > 0 else "No source available"
+    # response_source2 = response_sources[1].page_content.strip() if len(response_sources) > 1 else "No source available"
+    # response_source3 = response_sources[2].page_content.strip() if len(response_sources) > 2 else "No source available"
+    
+    response_source1_page = response_sources[0].metadata["page"] + 1 if len(response_sources) > 0 else "N/A"
+    # response_source2_page = response_sources[1].metadata["page"] + 1 if len(response_sources) > 1 else "N/A"
+    # response_source3_page = response_sources[2].metadata["page"] + 1 if len(response_sources) > 2 else "N/A"
+    
+    # Print to debug
+    print("Response Answer:", response_answer)
+    print("Response Sources:", response_sources)
     
     # Append user message and response to chat history
     new_history = history + [(message, response_answer)]
-    # return gr.update(value=""), new_history, response_sources[0], response_sources[1] 
-    return qa_chain, gr.update(value=""), new_history, response_source1, response_source1_page, response_source2, response_source2_page, response_source3, response_source3_page
     
+    # Handle possible missing image path
+    image_path = None
+    if len(response_sources) > 0:
+        image_path = render_file(response_sources[0].metadata["source"], response_source1_page)
+    print("Image Path:", image_path)    
+    
+    return qa_chain, gr.update(value=""), new_history, response_source1, response_source1_page, image_path
+
+
+    # formatted_chat_history = format_chat_history(message, history)
+    # #print("formatted_chat_history",formatted_chat_history)
+   
+    # # Generate response using QA chain
+    # response = qa_chain({"question": message, "chat_history": formatted_chat_history})
+    # # response = qa_chain({"query": message})
+    
+    # # if response_answer.find("Helpful Answer:") != -1:
+    # #     response_answer = response_answer.split("Helpful Answer:")[-1]
+    # print(response)
+    # response_answer = response["result"]
+    # if "Answer:" in response_answer:
+    #     response_answer = response_answer.split("Helpful Answer:")[-1]
+        
+    # response_sources = response["source_documents"]
+    # response_source1 = response_sources[0].page_content.strip()
+    # response_source2 = response_sources[1].page_content.strip()
+    # response_source3 = response_sources[2].page_content.strip()
+    
+    # # Langchain sources are zero-based
+    # response_source1_page = response_sources[0].metadata["page"] + 1
+    # response_source2_page = response_sources[1].metadata["page"] + 1
+    # response_source3_page = response_sources[2].metadata["page"] + 1
+    # # print ('chat response: ', response_answer)
+    # # print('DB source', response_sources)
+    
+    # # Append user message and response to chat history
+    # new_history = history + [(message, response_answer)]
+    # # new_history =  [(message, response_answer)] # removed memory of past history
+
+    # image_path = render_file(response_sources[0].metadata["source"], response_source1_page)
+    # print(image_path)    
+    # # return gr.update(value=""), new_history, response_sources[0], response_sources[1] 
+    # return qa_chain, gr.update(value=""), new_history, response_source1, response_source1_page, image_path
+    # # return qa_chain, gr.update(value=""), new_history, response_source1, response_source1_page, response_source2, response_source2_page, response_source3, response_source3_page, image
+    
+
+def clear_conversation(qa_chain):
+    qa_chain.memory.clear()
+    return qa_chain, gr.update(value=""), [], "", "", None
+
 
 def upload_file(file_obj):
     list_file_path = []
+    
     for idx, file in enumerate(file_obj):
         file_path = file_obj.name
         list_file_path.append(file_path)
-    # print(file_path)
-    # initialize_database(file_path, progress)
+
     return list_file_path
 
 
-# def render_file(self, file_name, file_page):
-#     """
-#     Renders a specific page of a PDF file as an image.
-
-#     Parameters:
-#         file (FileStorage): The PDF file.
-
-#     Returns:
-#         PIL.Image.Image: The rendered page as an image.
-#     """
-#     doc = fitz.open(file_name)
-#     page = doc[file_page]
-#     # pix = page.get_pixmap(matrix=fitz.Matrix(300 / 72, 300 / 72))
-#     pix = page.get_pixmap()
-#     image = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
-#     return image
-
+def render_file(file_name, file_page):
+    doc = fitz.open(file_name)
+    page = doc[file_page - 1]
+    pix = page.get_pixmap()
+    image = Image.frombytes('RGB', [pix.width, pix.height], pix.samples)
+    image_path = f"./page_{file_page}.png"
+    image.save(image_path)
+    
+    return image_path
 
 
 def demo():
-
+    # set visual properties
     image_path = './marlin_logo.png' # Replace with your image file path
     absolute_path = os.path.abspath(image_path)
     css_properties =  ".gradio-container {background: url('file=marlin_logo.png'); background-repeat: no-repeat; background-size: contain; background-position: center center;}"
@@ -329,103 +479,152 @@ def demo():
         """<center><h2>MARLIN (PDF-based chatbot)</center></h2>
         <h3>Ask any questions about your PDF documents</h3>""")
         
-        # gr.Markdown(
-        # """<b>Note:</b> This AI assistant, using Langchain and open-source LLMs, performs retrieval-augmented generation (RAG) from your PDF documents. \
-        # The user interface explicitly shows multiple steps to help understand the RAG workflow. 
-        # This chatbot takes past questions into account when generating answers (via conversational memory), and includes document references for clarity purposes.<br>
-        # <br><b>Warning:</b> This space uses the free CPU Basic hardware from Hugging Face. Some steps and LLM models used below (free inference endpoints) can take some time to generate a reply.
-        # """)
-        
         with gr.Tab("Step 1 - Upload PDF"):
             with gr.Row():
                 document = gr.Files(height=100, file_count="multiple", file_types=["pdf"], interactive=True, label="Upload your PDF documents (single or multiple)")
-                # upload_btn = gr.UploadButton("Loading document...", height=100, file_count="multiple", file_types=["pdf"], scale=1)
         
+
         with gr.Tab("Step 2 - Process document"):
             with gr.Row():
                 db_btn = gr.Radio(["ChromaDB"], label="Vector database type", value = "ChromaDB", type="index", info="Choose your vector database")
-            with gr.Accordion("Advanced options - Document text splitter", open=False):
+    
+            with gr.Accordion("Advanced options - Document text splitter", open=False):   
                 with gr.Row():
-                    slider_chunk_size = gr.Slider(minimum = 100, maximum = 1000, value=600, step=20, label="Chunk size", info="Chunk size", interactive=True)
+                    slider_chunk_size = gr.Slider(minimum = 100, maximum = 1000, value=600, step=10, label="Chunk size", info="Chunk size", interactive=True)
                 with gr.Row():
                     slider_chunk_overlap = gr.Slider(minimum = 10, maximum = 200, value=40, step=10, label="Chunk overlap", info="Chunk overlap", interactive=True)
+            
             with gr.Row():
                 db_progress = gr.Textbox(label="Vector database initialization", value="None")
+            
             with gr.Row():
                 db_btn = gr.Button("Generate vector database")
             
-        with gr.Tab("Step 3 - Initialize QA chain"):
+        with gr.Tab("Step 3 - Choose your LLM model"):
             with gr.Row():
-                llm_btn = gr.Radio(list_llm_simple, \
-                    label="LLM models", value = list_llm_simple[0], type="index", info="Choose your LLM model")
-            with gr.Accordion("Advanced options - LLM model", open=False):
-                with gr.Row():
-                    slider_temperature = gr.Slider(minimum = 0.01, maximum = 1.0, value=0.7, step=0.1, label="Temperature", info="Model temperature", interactive=True)
-                with gr.Row():
-                    slider_maxtokens = gr.Slider(minimum = 224, maximum = 4096, value=1024, step=32, label="Max Tokens", info="Model max tokens", interactive=True)
-                with gr.Row():
-                    slider_topk = gr.Slider(minimum = 1, maximum = 10, value=3, step=1, label="top-k samples", info="Model top-k samples", interactive=True)
-            with gr.Row():
-                llm_progress = gr.Textbox(value="None",label="QA chain initialization")
-            with gr.Row():
-                qachain_btn = gr.Button("Initialize Question Answering chain")
-
-        with gr.Tab("Step 4 - Chatbot"):
-            chatbot = gr.Chatbot(height=300)
-            with gr.Accordion("Advanced - Document references", open=False):
-                with gr.Row():
-                    doc_source1 = gr.Textbox(label="Reference 1", lines=2, container=True, scale=20)
-                    source1_page = gr.Number(label="Page", scale=1)
-                with gr.Row():
-                    doc_source2 = gr.Textbox(label="Reference 2", lines=2, container=True, scale=20)
-                    source2_page = gr.Number(label="Page", scale=1)
-                with gr.Row():
-                    doc_source3 = gr.Textbox(label="Reference 3", lines=2, container=True, scale=20)
-                    source3_page = gr.Number(label="Page", scale=1)
-            with gr.Row():
-                msg = gr.Textbox(placeholder="Type message (e.g. 'What is this document about?')", container=True)
-            with gr.Row():
-                submit_btn = gr.Button("Submit message")
-                clear_btn = gr.ClearButton([msg, chatbot], value="Clear conversation")
+                llm_btn = gr.Radio(list_llm_simple, label="Choose your LLM", value = list_llm_simple[0], type="index", interactive=True)
             
-        # Preprocessing events
-        #upload_btn.upload(upload_file, inputs=[upload_btn], outputs=[document])
-        db_btn.click(
-            initialize_database, \
-            inputs=[document, slider_chunk_size, slider_chunk_overlap], \
-            outputs=[vector_db, collection_name, db_progress]
-        )
+            with gr.Row():
+                system_prompt_input = gr.Textbox(label="System Prompt", placeholder="Enter a system prompt here...")
+            
+            with gr.Accordion("Advanced options - LLM configuration", open=False):   
+                with gr.Row():
+                    slider_llm_temperature = gr.Slider(minimum = 0.01, maximum = 1.0, value=0.5, step=0.1, label="Temperature", info="Temperature", interactive=True)
+                with gr.Row():
+                    slider_max_tokens = gr.Slider(minimum = 50, maximum = 4096, value=500, step=10, label="Max new tokens", info="Max new tokens", interactive=True)
+                with gr.Row():
+                    slider_top_k = gr.Slider(minimum = 1, maximum = 10, value=3, step=1, label="Top K tokens to sample from", info="Top K tokens", interactive=True)
+            
+            with gr.Row():
+                llm_progress = gr.Textbox(label="LLM model initialization", value="None")
+            
+            with gr.Row():
+                qachain_btn = gr.Button("Initialize LLM model")
         
-        qachain_btn.click(
-            initialize_LLM, \
-            inputs=[llm_btn, slider_temperature, slider_maxtokens, slider_topk, vector_db], \
-            outputs=[qa_chain, llm_progress]).then(lambda:[None,"",0,"",0,"",0], \
-            inputs=None, \
-            outputs=[chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], \
-            queue=False
+        with gr.Tab("Step 4 - Chat with PDF documents"):
+            with gr.Row():
+                
+                with gr.Column(scale=1):
+                    chatbot = gr.Chatbot(label="Chat with PDF document")
+                    txt_message = gr.Textbox(label="Enter your question", placeholder="Type message (e.g. 'What is this document about?')", container=True)
+                    send_button = gr.Button(value="Send", variant="primary")
+                    clear_btn = gr.ClearButton(value="Clear conversation", variant='secondary')
+                    # response = gr.Textbox(label="Context from document")
+                    with gr.Accordion("Advanced - Document references", open=False):
+                        with gr.Row():
+                            doc_source1 = gr.Textbox(label="Reference 1", lines=2, container=True, scale=20)
+                            source1_page = gr.Number(label="Page", scale=1)
+                
+                with gr.Column(scale=1):
+                    image_display = gr.Image(label="Context page image")
+            
+        
+        #define actions
+        db_btn.click(
+            initialize_database, 
+            inputs=[document, slider_chunk_size, slider_chunk_overlap],
+            outputs=[vector_db, collection_name, db_progress],
         )
 
-        # Chatbot events
-        msg.submit(
-            conversation, \
-            inputs=[qa_chain, msg, chatbot], \
-            outputs=[qa_chain, msg, chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], \
-            queue=False
-        ) # .success(render_file, inputs=[document, doc_source1], outputs=[show_img])
-        
-        submit_btn.click(
-            conversation, \
-            inputs=[qa_chain, msg, chatbot], \
-            outputs=[qa_chain, msg, chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], \
-            queue=False
-        ) # .success(render_file, inputs=[document, doc_source1], outputs=[show_img])
-        
-        clear_btn.click(
-            lambda:[None,"",0,"",0,"",0], \
-            inputs=None, \
-            outputs=[chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], \
-            queue=False
+        qachain_btn.click(
+            initialize_LLM, 
+            inputs=[llm_btn, slider_llm_temperature, slider_max_tokens, slider_top_k, vector_db, system_prompt_input],
+            outputs=[qa_chain, llm_progress],
         )
+
+        send_button.click(
+            conversation, 
+            inputs=[qa_chain, txt_message, chatbot],
+            outputs=[qa_chain, txt_message, chatbot, doc_source1, source1_page, image_display],
+        )
+    
+        clear_btn.click(
+            clear_conversation,
+            inputs=[qa_chain],
+            outputs=[qa_chain, txt_message, chatbot, doc_source1, source1_page, image_display]
+        )
+
+        # with gr.Tab("Step 4 - Chatbot"):
+        #     chatbot = gr.Chatbot(height=300)
+            
+        #     with gr.Accordion("Advanced - Document references", open=False):
+        #         with gr.Row():
+        #             doc_source1 = gr.Textbox(label="Reference 1", lines=2, container=True, scale=20)
+        #             source1_page = gr.Number(label="Page", scale=1)
+                    
+        #         with gr.Row():
+        #             doc_source2 = gr.Textbox(label="Reference 2", lines=2, container=True, scale=20)
+        #             source2_page = gr.Number(label="Page", scale=1)
+                    
+        #         with gr.Row():
+        #             doc_source3 = gr.Textbox(label="Reference 3", lines=2, container=True, scale=20)
+        #             source3_page = gr.Number(label="Page", scale=1)
+            
+        #     with gr.Row():
+        #         msg = gr.Textbox(placeholder="Type message (e.g. 'What is this document about?')", container=True)
+            
+        #     with gr.Row():
+        #         submit_btn = gr.Button("Submit message")
+        #         clear_btn = gr.ClearButton([msg, chatbot], value="Clear conversation")
+            
+        # # Preprocessing events
+        # #upload_btn.upload(upload_file, inputs=[upload_btn], outputs=[document])
+        # db_btn.click(
+        #     initialize_database, 
+        #     inputs = [document, slider_chunk_size, slider_chunk_overlap], 
+        #     outputs = [vector_db, collection_name, db_progress]
+        # )
+        
+        # qachain_btn.click(
+        #     initialize_LLM, 
+        #     inputs = [llm_btn, slider_temperature, slider_maxtokens, slider_topk, vector_db], 
+        #     outputs = [qa_chain, llm_progress]).then(lambda:[None, "", 0, "", 0, "", 0], 
+        #     inputs = None, 
+        #     outputs = [chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], 
+        #     queue = False
+        # )
+
+        # # Chatbot events
+        # msg.submit(
+        #     conversation, 
+        #     inputs = [qa_chain, msg, chatbot], 
+        #     outputs = [qa_chain, msg, chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], 
+        #     queue = False,
+        # ) # .success(render_file, inputs=[document, doc_source1], outputs=[show_img])
+        
+        # submit_btn.click(
+        #     conversation, 
+        #     inputs = [qa_chain, msg, chatbot], 
+        #     outputs = [qa_chain, msg, chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], 
+        #     queue = False
+        # ) # .success(render_file, inputs=[document, doc_source1], outputs=[show_img])
+        
+        # clear_btn.click(
+        #     lambda:[None,"",0,"",0,"",0], 
+        #     inputs = None, 
+        #     outputs = [chatbot, doc_source1, source1_page, doc_source2, source2_page, doc_source3, source3_page], 
+        #     queue = False
+        # )
         
     demo.queue().launch(debug=True, allowed_paths=[absolute_path])
 
